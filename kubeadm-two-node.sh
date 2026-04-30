@@ -21,6 +21,7 @@
 #   POD_CIDR=192.168.0.0/16           # Calico default
 #   PUBLIC_IP_ACCESS=true|false       # master: use public IP for control-plane endpoint
 #   CALICO_VERSION=v3.31.3            # Calico manifests version
+#   IPTABLES_BACKEND=nft|legacy       # pick ONE to avoid NodePort issues (default: nft)
 
 set -euo pipefail
 
@@ -32,8 +33,33 @@ CRICTL_VERSION="${CRICTL_VERSION:-v1.28.0}"
 POD_CIDR="${POD_CIDR:-192.168.0.0/16}"
 PUBLIC_IP_ACCESS="${PUBLIC_IP_ACCESS:-false}"
 CALICO_VERSION="${CALICO_VERSION:-v3.31.3}"
+IPTABLES_BACKEND="${IPTABLES_BACKEND:-nft}"
 
 log() { echo "[kubeadm-two-node] $*"; }
+
+set_iptables_backend() {
+  # Ubuntu can have both nft + legacy installed. kube-proxy programs NodePort via iptables;
+  # mixed backends can lead to "packets arrive but never DNAT to pods".
+  case "$IPTABLES_BACKEND" in
+    nft)
+      if command -v update-alternatives >/dev/null 2>&1; then
+        sudo update-alternatives --set iptables /usr/sbin/iptables-nft >/dev/null 2>&1 || true
+        sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-nft >/dev/null 2>&1 || true
+      fi
+      ;;
+    legacy)
+      if command -v update-alternatives >/dev/null 2>&1; then
+        sudo update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true
+        sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true
+      fi
+      ;;
+    *)
+      echo "Invalid IPTABLES_BACKEND=$IPTABLES_BACKEND (use nft or legacy)" >&2
+      exit 1
+      ;;
+  esac
+  log "Using iptables backend: $IPTABLES_BACKEND ($(sudo iptables --version 2>/dev/null || true))"
+}
 
 detect_nic() {
   if [[ -n "${NETWORK_INTERFACE:-}" ]]; then
@@ -52,6 +78,7 @@ ensure_prereqs() {
 
 common_setup() {
   ensure_prereqs
+  set_iptables_backend
   log "Disabling swap + setting sysctls..."
   sudo swapoff -a || true
   (sudo crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | sudo crontab - || true
@@ -73,6 +100,10 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
   sudo sysctl --system
+  # Loose rp_filter helps in public-cloud NAT / asymmetric routing situations.
+  sudo sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null || true
+  sudo sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null || true
+  sudo sysctl -w net.ipv4.conf.eth0.rp_filter=2 >/dev/null || true
 
   log "Installing containerd..."
   sudo install -m 0755 -d /etc/apt/keyrings
@@ -133,6 +164,7 @@ EOF
 
 master_setup() {
   ensure_prereqs
+  set_iptables_backend
   NIC="$(detect_nic)"
   if [[ -z "$NIC" ]] || ! ip link show "$NIC" &>/dev/null; then
     echo "Set NETWORK_INTERFACE to your primary NIC (e.g. export NETWORK_INTERFACE=eth0)" >&2
@@ -166,16 +198,20 @@ master_setup() {
 
   log "Configuring kubeconfig..."
   mkdir -p "$HOME/.kube"
-  sudo cp -i /etc/kubernetes/admin.conf "$HOME/.kube/config"
-  sudo chown "$(id -u)":"$(id -g)" "$HOME/.kube/config"
+  sudo cp -f /etc/kubernetes/admin.conf "$HOME/.kube/config"
+  sudo chown -R "$(id -u)":"$(id -g)" "$HOME/.kube"
+  chmod 700 "$HOME/.kube" || true
+  chmod 600 "$HOME/.kube/config" || true
 
   log "Installing Calico CNI ($CALICO_VERSION)..."
-  kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/operator-crds.yaml"
-  kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
+  kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/operator-crds.yaml"
+  kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
   sleep 120
-  curl -fsSLO "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml"
-  sed -i "s|cidr: 192.168.0.0/16|cidr: ${POD_CIDR}|g" custom-resources.yaml
-  kubectl apply -f custom-resources.yaml
+  tmp_cr="$(mktemp)"
+  curl -fsSL "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml" -o "$tmp_cr"
+  sed -i "s|cidr: 192.168.0.0/16|cidr: ${POD_CIDR}|g" "$tmp_cr" || true
+  kubectl apply -f "$tmp_cr"
+  rm -f "$tmp_cr"
   sleep 30
 
   log "Control plane complete. Join command:"

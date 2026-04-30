@@ -39,3 +39,4 @@ kubectl get nodes -o wide
 
 - If the script picks the wrong NIC, force it: `export NETWORK_INTERFACE=eth0`
 - To advertise the public IP for the API server: `export PUBLIC_IP_ACCESS=true`
+- If NodePort from the internet is flaky, force a single iptables backend (recommended on Ubuntu): `export IPTABLES_BACKEND=nft`
