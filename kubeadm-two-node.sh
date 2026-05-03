@@ -156,7 +156,12 @@ EOF
     echo "Could not detect node IP for interface $NIC" >&2
     exit 1
   fi
-  echo "KUBELET_EXTRA_ARGS=--node-ip=$local_ip" | sudo tee /etc/default/kubelet >/dev/null
+  # echo "KUBELET_EXTRA_ARGS=--node-ip=$local_ip" | sudo tee /etc/default/kubelet >/dev/null
+  
+  # edited - also set hostname-override to avoid "node(s) had no node IPs" issues in some environments (e.g. Tencent Cloud with asymmetric routing from master to worker pod IPs)
+  NODE_NAME_LOWER="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+  echo "KUBELET_EXTRA_ARGS=--node-ip=$local_ip --hostname-override=$NODE_NAME_LOWER" | sudo tee /etc/default/kubelet >/dev/null
+
   sudo systemctl enable kubelet
 
   log "Common setup complete."
@@ -174,7 +179,10 @@ master_setup() {
   log "Pulling kubeadm images..."
   sudo kubeadm config images pull
 
-  NODENAME="$(hostname -s)"
+  # NODENAME="$(hostname -s)"
+
+  # edited
+  NODENAME="$(hostname -s | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$PUBLIC_IP_ACCESS" == "true" ]]; then
     MASTER_PUBLIC_IP="$(curl -fsSL ifconfig.me)"
@@ -204,12 +212,31 @@ master_setup() {
   chmod 600 "$HOME/.kube/config" || true
 
   log "Installing Calico CNI ($CALICO_VERSION)..."
-  kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/operator-crds.yaml"
+  # kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/operator-crds.yaml"
+  
+  # edited
+  kubectl apply --server-side --force-conflicts \
+  -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/operator-crds.yaml"
+
   kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
   sleep 120
   tmp_cr="$(mktemp)"
   curl -fsSL "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/custom-resources.yaml" -o "$tmp_cr"
   sed -i "s|cidr: 192.168.0.0/16|cidr: ${POD_CIDR}|g" "$tmp_cr" || true
+
+  # edited - 
+  # VXLANCrossSubnet falls back to direct routing (no encapsulation) between nodes
+  # on the same subnet. Cloud networks (e.g. Tencent Cloud) drop packets whose
+  # destination is a Pod IP (192.168.x.x) because it is not a registered VM IP,
+  # causing NodePort requests forwarded from the master to worker Pods to silently fail.
+  # Switch to full VXLAN encapsulation so all cross-node Pod traffic is wrapped in UDP.
+  #
+  # To fix manually inside the node:
+  #   kubectl edit installation default
+  #   change encapsulation: VXLANCrossSubnet → encapsulation: VXLAN
+  sed -i "s|encapsulation: VXLANCrossSubnet|encapsulation: VXLAN|g" "$tmp_cr" 
+
+
   kubectl apply -f "$tmp_cr"
   rm -f "$tmp_cr"
   sleep 30
